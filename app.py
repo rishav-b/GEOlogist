@@ -1,16 +1,3 @@
-"""
-app.py  –  GEOlogist Streamlit dashboard
-=========================================
-Fetches any GEO study (RNA-seq or microarray), builds an expression matrix,
-and normalises to log2(CPM + 1) for RNA-seq.
-
-RNA-seq pipeline  : geo_rnaseq_normalizer  (GEO supplementary files)
-Microarray pipeline: async GSM VALUE table fetch + GPL annotation + log2
-
-Run:
-    streamlit run app.py
-"""
-
 import asyncio
 import io
 import os
@@ -24,16 +11,8 @@ import streamlit as st
 
 import geo_rnaseq_normalizer as geo_norm
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────────────────────
-
 st.set_page_config(page_title="GEOlogist", page_icon="🧬")
 st.title("GEOlogist 🧬")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar – Groq API key (required before any fetch)
-# ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Configuration")
@@ -50,14 +29,10 @@ with st.sidebar:
 
 if not groq_key:
     st.info(
-        "👈 Enter your **Groq API key** in the sidebar to get started.\n\n"
+        "<- Enter your **Groq API key** in the sidebar to get started.\n\n"
         "Get a free key (no credit card) at **console.groq.com → API Keys**."
     )
     st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GSE input
-# ─────────────────────────────────────────────────────────────────────────────
 
 gse_id = st.text_input("Enter GEO accession:", placeholder="e.g. GSE183620")
 
@@ -65,10 +40,6 @@ if not gse_id:
     st.stop()
 
 gse_id = gse_id.strip().upper()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Metadata fetch
-# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Fetching GEO metadata…")
 def fetch_metadata(gse_id: str) -> dict:
@@ -123,9 +94,6 @@ st.caption(
     f"Taxon: {meta['taxon']}"
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Microarray helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def _fetch_single_gsm(
     client: httpx.AsyncClient,
@@ -248,11 +216,6 @@ def fetch_microarray_matrix(meta: dict) -> pd.DataFrame | None:
 
     return final_df
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RNA-seq pipeline via geo_rnaseq_normalizer
-# ─────────────────────────────────────────────────────────────────────────────
-
 def fetch_rnaseq_matrix(gse_id: str) -> pd.DataFrame | None:
     try:
         result = geo_norm.fetch_and_normalize(
@@ -288,11 +251,6 @@ def fetch_rnaseq_matrix(gse_id: str) -> pd.DataFrame | None:
         )
     return df
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fetch button
-# ─────────────────────────────────────────────────────────────────────────────
-
 if st.button("Fetch & Build Matrix", type="primary"):
 
     with st.status("Running pipeline…", expanded=True) as status:
@@ -313,7 +271,6 @@ if st.button("Fetch & Build Matrix", type="primary"):
 
         status.update(label="Done!", state="complete")
 
-    # ── Summary metrics ───────────────────────────────────────────────────────
     n_genes   = combined_df.shape[0]
     n_samples = combined_df.shape[1] - (1 if "Name" in combined_df.columns else 0)
 
@@ -322,7 +279,6 @@ if st.button("Fetch & Build Matrix", type="primary"):
     c2.metric("Samples", n_samples)
     c3.metric("Normalisation", "log2(CPM+1)")
 
-    # ── Table ─────────────────────────────────────────────────────────────────
     st.dataframe(
         combined_df,
         use_container_width=True,
@@ -332,10 +288,9 @@ if st.button("Fetch & Build Matrix", type="primary"):
         },
     )
 
-    # ── Download ──────────────────────────────────────────────────────────────
     tsv = combined_df.to_csv(sep="\t", index=False)
     st.download_button(
-        label="⬇️ Download as .txt (tab-separated)",
+        label="⬇ Download as .txt (tab-separated)",
         data=tsv,
         file_name=f"{gse_id}_log2CPM.txt",
         mime="text/plain",
