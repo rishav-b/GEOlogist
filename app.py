@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 
 import GEOparse
@@ -155,23 +156,88 @@ def _fetch_gpl_tables(gpl_ids: list[str]) -> dict[str, pd.DataFrame]:
 
 
 def _annotate_matrix(df: pd.DataFrame, gpl_tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    # Keep original index as a column for mapping
+    df = df.reset_index()
+    df.rename(columns={df.columns[0]: "_probe_id"}, inplace=True)
+    
+    # Check if probe IDs look like gene symbols already (not probe IDs or Ensembl)
+    probe_ids = [str(pid).strip() for pid in df["_probe_id"]]
+    looks_like_symbols = all(
+        not (pid.isdigit() or pid.startswith("ENSG") or pid.startswith("ENST") or pid.startswith("AFFX") or pid.startswith("ILMN"))
+        for pid in probe_ids[:min(100, len(probe_ids))]
+    )
+    
+    if looks_like_symbols:
+        df.insert(0, "Name", df["_probe_id"])
+        df = df.drop("_probe_id", axis=1)
+        return df
+    
     master_mapping: dict[str, str] = {}
-    for gpl_table in gpl_tables.values():
-        id_col = next(
-            (c for c in gpl_table.columns if c.upper() in ("ID", "ID_REF")),
-            gpl_table.columns[0],
-        )
-        symbol_col = next(
-            (c for c in gpl_table.columns if "symbol" in c.lower()), None
-        )
-        if symbol_col:
-            for probe, sym in zip(
-                gpl_table[id_col].astype(str).str.strip(),
-                gpl_table[symbol_col].astype(str).str.strip(),
-            ):
-                master_mapping[probe] = sym
+    probe_ids_set = set(probe_ids)
 
-    df.insert(0, "Name", [master_mapping.get(str(idx).strip(), idx) for idx in df.index])
+    # Placeholder/null values common in GPL annotation tables
+    NULL_VALUES = {"---", "na", "none", "nan", "n/a", "", "unknown", "null"}
+    
+    for gpl_table in gpl_tables.values():
+        # Find which column in the platform table matches the IDs in df
+        matching_col = None
+        best_overlap = 0
+        for col in gpl_table.columns:
+            gpl_ids = set(gpl_table[col].astype(str).str.strip())
+            overlap = len(gpl_ids & probe_ids_set)
+            if overlap > best_overlap and overlap > len(probe_ids) * 0.5:
+                best_overlap = overlap
+                matching_col = col
+        # No early break — find the BEST matching column, not just the first
+        
+        if not matching_col:
+            continue
+        
+        # Use Groq to identify the gene symbol column
+        column_names = gpl_table.columns.tolist()
+        prompt = f"""
+You are a bioinformatics expert. Given these column names from a microarray platform annotation:
+{json.dumps(column_names)}
+
+Which column most likely contains gene symbols (HGNC symbols, gene names)?
+Return ONLY the column name, nothing else. Return null if none look like gene symbols.
+"""
+        try:
+            resp = geo_norm._get_client().chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "You are an expert. Return only a column name or null."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0, max_tokens=50,
+            )
+            symbol_col = resp.choices[0].message.content.strip().strip('"').strip("'").strip()
+            if symbol_col.lower() == "null" or symbol_col not in column_names:
+                continue
+            # Guard: symbol column must be different from the ID column
+            if symbol_col == matching_col:
+                continue
+        except Exception as e:
+            st.warning(f"Groq annotation lookup failed: {e}")
+            continue
+
+        print(f"matching_col={matching_col!r}, symbol_col={symbol_col!r}")
+    
+    # Build mapping, skipping null/placeholder gene symbol values
+    if symbol_col in gpl_table.columns and matching_col in gpl_table.columns:
+        for probe, sym in zip(
+            gpl_table[matching_col].astype(str).str.strip(),
+            gpl_table[symbol_col].astype(str).str.strip(),
+        ):
+            if probe and sym and sym.lower() not in NULL_VALUES:
+                if ("//" in sym):
+                    sym = sym.split("//")[1].strip()
+                master_mapping[probe] = sym
+    print(master_mapping)
+
+    df["Name"] = df["_probe_id"].apply(lambda x: master_mapping[str(x).strip()] if str(x).strip() in master_mapping.keys() else np.nan)
+    df.dropna(subset=["Name"], inplace=True)
+    df = df.drop("_probe_id", axis=1)
     return df
 
 

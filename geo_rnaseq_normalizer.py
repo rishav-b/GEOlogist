@@ -179,6 +179,32 @@ Types: raw_counts | cpm | rpkm_fpkm | tpm | log_transformed | vst_rlog |
        quantile | tmm_rle | microarray_rma | fold_change | z_score | unknown
 Focus on what is stored in the final supplementary files."""
 
+_FILE_NORM_SYSTEM = """You are a bioinformatics expert specializing in GEO datasets.
+Classify the normalization type of this specific supplementary file based on its name.
+Return ONLY valid JSON, no markdown:
+{
+  "normalization_type": "<type>",
+  "confidence": "<high|medium|low>",
+  "reasoning": "<brief>"
+}
+Types: raw_counts | cpm | rpkm_fpkm | tpm | log_transformed | vst_rlog |
+       quantile | tmm_rle | microarray_rma | fold_change | z_score | unknown
+Focus on how the names indicate what might be stored in the final supplementary files."""
+
+def classify_normalization_of_supp_file(fname: str) -> bool:
+    resp = _get_client().chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": _FILE_NORM_SYSTEM},
+            {"role": "user",   "content": f"Classify:\n\n{fname}"},
+        ],
+        temperature=0, max_tokens=300,
+    )
+    text = resp.choices[0].message.content.strip()
+    text = re.sub(r"^```(?:json)?", "", text).rstrip("`").strip()
+    result = json.loads(text)
+    print(result)
+    return (result.get("normalization_type") in ("raw_counts", "cpm") or result.get("confidence") == "low")
 
 def classify_normalization(dp_text: str) -> dict:
     resp = _get_client().chat.completions.create(
@@ -231,7 +257,7 @@ def _download_all(urls: list[str]) -> dict[str, bytes]:
     results: dict[str, bytes] = {}
     print(f"  Downloading {len(urls)} file(s) in parallel…")
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(_WORKERS, len(urls))) as ex:
-        fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
+        fut_to_url = {ex.submit(_download_bytes, u): u for u in urls if classify_normalization_of_supp_file(u.split("/")[-1])}
         for fut in concurrent.futures.as_completed(fut_to_url):
             url = fut_to_url[fut]
             fname = url.split("/")[-1]
@@ -645,6 +671,7 @@ def _no_merge_build(
 
             dfs.append(df)
 
+
         except Exception as e:
             print(f"  [warn] {filename}: {e}")
 
@@ -666,8 +693,57 @@ def _no_merge_build(
     return merged
 
 def _build_matrix(url_bytes: dict[str, bytes], file_meta: list[dict]) -> pd.DataFrame:
-    # ...existing code...
-    return pd.DataFrame() 
+    series_list: list[pd.Series] = []
+    whole_tar = False
+    for meta in file_meta:
+        url      = meta["url"]
+        filename = meta["filename"]
+        raw      = url_bytes.get(url)
+        if raw is None:
+            continue
+
+        if meta["is_tar"]:
+            whole_tar = True
+            print(f"  Unpacking TAR: {filename}")
+            members = _unpack_tar(raw)
+            print(f"    → {len(members)} tabular member(s)")
+            for mname, mbytes in members.items():
+                mbytes, bare = _decompress(mbytes, mname)
+                try:
+                    s, sname = _parse_tabular(mbytes, bare)
+                    s.name = sname
+                    series_list.append(s)
+                except Exception as e:
+                    print(f"    [warn] {mname}: {e}")
+        else:
+            raw, bare = _decompress(raw, filename)
+            print(raw[0:100].decode("utf-8", errors="replace"))
+            try:
+                s, sname = _parse_tabular(raw, bare)
+                s.name = sname
+                series_list.append(s)
+            except Exception as e:
+                print(f"  [warn] {filename}: {e}")
+
+    if not series_list:
+        raise RuntimeError("No count data could be parsed from any file.")
+    
+    if whole_tar and len(series_list) > 1:
+        print(f"\n  Merging {len(series_list)} sample series…")
+        df = pd.concat(series_list, axis=1, join="outer")
+        df = df.apply(pd.to_numeric, errors="coerce")
+        df.index.name = "gene_id"
+        print(f"  ✓ Merged matrix: {df.shape[0]} genes × {df.shape[1]} samples")
+        return df
+    elif len(series_list) == 1:
+        s = series_list[0]
+        df = s.to_frame()
+        df.index.name = "gene_id"
+        print(f"  ✓ Single sample matrix: {df.shape[0]} genes × 1 sample")
+        return df
+    else:
+        print("LMAO something went wrong")
+        return pd.DataFrame()  # should not happen due to earlier check
 
 def _merge_gsm_files(url_bytes: dict[str, bytes], file_meta: list[dict]) -> pd.DataFrame:
     """Merge individual GSM supplementary files into a single matrix.
@@ -849,51 +925,11 @@ def fetch_and_normalize(
 
     # ── download ──────────────────────────────────────────────────────────────
     if norm_type == "cpm" or norm_type == "raw_counts":
-        found = _download_raw(accession, file_meta, geo_cache_dir)
-        if found == 0:
-            # Check if we only have TAR files
-            if file_meta and all(m["is_tar"] for m in file_meta):
-                print(f"  Found only TAR files. Checking if GSMs have individual supplementary files…")
-                gsm_files = _collect_gsm_supp_urls(geo)
-                if gsm_files and not all(f["is_tar"] for f in gsm_files):
-                    print(f"  ✓ Found {len(gsm_files)} individual GSM supplementary files")
-                    file_meta = gsm_files
-                    url_bytes = _download_all([m["url"] for m in file_meta])
-                    counts_df = _merge_gsm_files(url_bytes, file_meta)
-                else:
-                    url_bytes = _download_all([m["url"] for m in file_meta])
-                    counts_df = _build_matrix(url_bytes, file_meta)
-            else: 
-                url_bytes = _download_all([m["url"] for m in file_meta])
-                if file_meta and file_meta[0]["is_tar"]:
-                    counts_df = _build_matrix(url_bytes, file_meta)
-                else:
-                    counts_df = _no_merge_build(url_bytes, file_meta)
+        url_bytes = _download_all([m["url"] for m in file_meta])
+        if file_meta and file_meta[0]["is_tar"]:
+            counts_df = _build_matrix(url_bytes, file_meta)
         else:
-            """# Check if we only have TAR files
-            if file_meta and all(m["is_tar"] for m in file_meta):
-                print(f"  Found only TAR files. Checking if GSMs have individual supplementary files…")
-                gsm_files = _collect_gsm_supp_urls(geo)
-                if gsm_files and not all(f["is_tar"] for f in gsm_files):
-                    print(f"  ✓ Found {len(gsm_files)} individual GSM supplementary files")
-                    file_meta = gsm_files
-                    url_bytes = _download_all([m["url"] for m in file_meta])
-                    counts_df = _merge_gsm_files(url_bytes, file_meta)
-                else:
-                    url_bytes = _download_all([m["url"] for m in file_meta])
-                    counts_df = _build_matrix(url_bytes, file_meta)
-            else:
-                counts_df = fetch_and_normalize_ncbi_gen(accession, file_meta, geo_cache_dir)
-                # Found raw count files, reassign normalization type
-                if file_meta and any("raw" in m["filename"].lower() for m in file_meta):
-                    print(f"  [reassign] Found raw count files; updating norm_type: {norm_type} → raw_counts")
-                    norm_type = "raw_counts"
-            """
-            counts_df = fetch_and_normalize_ncbi_gen(accession, file_meta, geo_cache_dir)
-            # Found raw count files, reassign normalization type
-            if file_meta and any("raw" in m["filename"].lower() for m in file_meta):
-                print(f"  [reassign] Found raw count files; updating norm_type: {norm_type} → raw_counts")
-                norm_type = "raw_counts"
+            counts_df = _no_merge_build(url_bytes, file_meta)
 
     else:
         # Check if we only have TAR files
