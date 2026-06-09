@@ -84,18 +84,15 @@ def get_gene_symbol_column(gse_id, counts_df, probe_ids=None):
     
 
 def _strip_version(s: str) -> str:
-    """ENSG00000141510.14 → ENSG00000141510, NM_001234.5 → NM_001234"""
     return re.sub(r'\.\d+$', '', s)
 
 def _normalize_id(s: str) -> str:
     s = str(s).strip().upper()
-    # float → int: "1234.0" → "1234"
     if re.match(r'^\d+\.0$', s):
         s = s[:-2]
     return s
 
 def _overlap_score(index_set: set[str], col_vals: pd.Series) -> float:
-    """Try exact match first, then version-stripped match."""
     col_set_raw = set(col_vals.apply(_normalize_id))
 
     # exact (normalized)
@@ -103,7 +100,7 @@ def _overlap_score(index_set: set[str], col_vals: pd.Series) -> float:
     if exact > 0:
         return exact
 
-    # version-stripped fallback
+    # version-stripped
     index_stripped = {_strip_version(v) for v in index_set}
     col_stripped   = {_strip_version(v) for v in col_set_raw}
     return len(index_stripped & col_stripped) / len(index_set)
@@ -122,7 +119,3 @@ def _find_best_id_col(index_set: set[str], gpl_df: pd.DataFrame) -> tuple[str, f
 
     print(f"  → best id col: '{best_col}' (score {best_score:.3f})")
     return best_col, best_score
-
-#col = get_gene_symbol_column("GSE63596")
-
-#print(col)
