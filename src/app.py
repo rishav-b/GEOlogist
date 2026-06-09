@@ -268,7 +268,7 @@ def to_cpm(df: pd.DataFrame) -> pd.DataFrame:
     col_sums = numeric_df.sum(axis=0).replace(0, np.nan)
     return numeric_df.divide(col_sums, axis=1) * 1e6
 
-def fetch_microarray_matrix(meta: dict) -> pd.DataFrame | None:
+def fetch_microarray_matrix(meta: dict):
     gpl_tables = _fetch_gpl_tables(meta["gpl_ids"])
     geo = GEOparse.get_GEO(gse_id)
     if gse_id.startswith("GSE"):
